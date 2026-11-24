@@ -68,12 +68,44 @@ alt_read() {
 	fi
 }
 
+LOGMARK="smsbridge: a PDU part did not go out"
 alt_send() {
+	local out=/tmp/aw1000-voice-sms.send.$$ pid rc n0 why
+
 	if [ "$alt" = NoobWRT ]; then
-		"$BRIDGE" send "$1" "$2" "$sport" 2>&1
+		n0=$(logread 2>/dev/null | grep -c "$LOGMARK")
+		"$BRIDGE" send "$1" "$2" "$sport" > "$out" 2>&1 &
+		pid=$!
+		wait $pid
+		rc=$?
+		case "$(cat "$out")" in
+		*queued*)
+			rm -f /etc/5gmodem/smsq/*."$pid".sms
+			why=
+			[ "$(logread 2>/dev/null | grep -c "$LOGMARK")" -gt "$n0" ] && why=$(logread 2>/dev/null | grep "$LOGMARK" | tail -1 | sed 's/.*): //')
+			echo "$(send_error "$why")"
+			rc=1 ;;
+		*)
+			cat "$out"
+			[ "$rc" = 0 ] || echo "$(send_error "$(tail -1 "$out" | sed "s/^sms sending failed: //")")" ;;
+		esac
+		rm -f "$out"
+		return $rc
 	else
-		sms_tool_q -d "$sport" send "$1" "$2" 2>&1
+		why=$(sms_tool_q -d "$sport" send "$1" "$2" 2>&1) || { send_error "$(printf '%s' "$why" | tail -1)"; return 1; }
 	fi
+}
+
+send_error() {
+	case "$1" in
+	'') echo "Not sent: the modem is busy, try again in a moment" ;;
+	*"CMS ERROR: 21"|*"CMS ERROR: 50"|*"CMS ERROR: 69"|*"CMS ERROR: 350")
+		echo "Not sent: the network refused it. Check your credit" ;;
+	*"CMS ERROR: 33"[0-2]*|*"no network"*) echo "Not sent: no network" ;;
+	*CMGS=*) echo "Not sent: the modem did not take it, try again" ;;
+	*unknown*) echo "Not sure it was sent: the modem did not confirm it" ;;
+	*) echo "Not sent: $1" ;;
+	esac
 }
 
 alt_delete() {
@@ -179,6 +211,30 @@ name_of() {
 	done
 }
 
+CACHE=/tmp/aw1000-voice-sms.cache
+cache_age() { echo $(($(date +%s) - $(date -r "$CACHE/rows" +%s 2>/dev/null || echo 0))); }
+
+alt_cached() {
+	rm -rf "$QD"
+	[ "$(cache_age)" -lt "$1" ] && cp -r "$CACHE" "$QD" 2>/dev/null && return 0
+	rm -rf "$QD"
+	(
+		flock 9
+		[ "$(cache_age)" -lt "$1" ] && exit 0
+		QD=$CACHE.new
+		if alt_collect; then
+			rm -rf "$CACHE.old"
+			mv "$CACHE" "$CACHE.old" 2>/dev/null
+			mv "$QD" "$CACHE"
+			rm -rf "$CACHE.old"
+		else
+			rm -rf "$QD"
+			[ -f "$CACHE/rows" ]
+		fi
+	) 9> /tmp/aw1000-voice-sms.lock || return 1
+	cp -r "$CACHE" "$QD"
+}
+
 # epoch from an ISO 8601 timestamp like 2026-11-12T10:15:30+05:30, NoobWRT's
 # 2026-11-12 10:15, or QModem's epoch seconds
 epoch() {
@@ -220,21 +276,33 @@ sms_indexes() {
 
 	rm -rf "$QD"
 	if ! m=$(modem); then
-		alt && alt_collect && cut -d'|' -f1 "$QD/rows"
+		alt && alt_cached "${MAXAGE:-60}" && cut -d'|' -f1 "$QD/rows"
 		return
 	fi
 	mmcli -m "$m" --messaging-list-sms 2>/dev/null | sed -n 's#.*/SMS/\([0-9][0-9]*\).*#\1#p'
 }
 
 cmd_list() {
-	local i read_at n_unread=0 rows=/tmp/aw1000-voice-sms.$$ at name has_modem=0
+	local i read_at n_unread=0 rows=/tmp/aw1000-voice-sms.$$ at name has_modem=0 ids txt contacts
 
 	read_at=$(cat "$READ" 2>/dev/null || echo 0)
 	{ modem >/dev/null || alt; } && has_modem=1
 	# Pass 1: read every SMS (json_load reuses the jshn buffer, so the
 	# reply is built only afterwards, from these files).
 	: > "$rows.out"
-	for i in $(sms_indexes); do
+	txt=$rows
+	ids=$(sms_indexes)
+	if [ -f "$QD/rows" ]; then
+		txt=$QD/t
+		uci -q show fxs | grep -q '=\(contact\|speed\|block\)$' && contacts=1
+		while IFS='|' read -r i at number; do
+			name=
+			[ -n "$contacts" ] && name=$(name_of "$number" | tr '|\n' '/ ')
+			echo "$i|$at|received|deliver|$number|$name" >> "$rows.out"
+		done < "$QD/rows"
+		ids=
+	fi
+	for i in $ids; do
 		load_sms "$i" || continue
 		at=$(epoch "$ts")
 		name=$(name_of "$number")
@@ -252,7 +320,7 @@ cmd_list() {
 		json_add_int time "$at"
 		json_add_string number "$number"
 		json_add_string name "$name"
-		json_add_string text "$(cat "$rows.$i")"
+		json_add_string text "$(cat "$txt.$i")"
 		json_add_string state "$state"
 		json_add_string direction "$([ "$type" = submit ] && echo out || echo in)"
 		if [ "$type" != submit ] && [ "$at" -gt "$read_at" ]; then
@@ -282,7 +350,7 @@ cmd_send() {
 		if ! alt; then
 			err="no modem found in ModemManager, NoobWRT or QModem"
 		elif ! out=$(alt_send "$number" "$(cat "$file")"); then
-			err="$alt could not send it: $(printf '%s' "$out" | tail -1)"
+			err=$(printf '%s' "$out" | tail -1)
 		fi
 	elif ! out=$(mmcli -m "$m" --messaging-create-sms="number='$number'" --messaging-create-sms-with-text="$file" 2>&1); then
 		err="could not create the SMS: $(printf '%s' "$out" | tail -1)"
@@ -317,14 +385,14 @@ cmd_delete() {
 	local m i j
 
 	if ! m=$(modem); then
-		alt && alt_collect || { echo "no modem"; return 1; }
+		alt && alt_cached 60 || { echo "no modem"; return 1; }
 		for i in "$@"; do
 			case "$i" in ''|*[!0-9]*) continue ;; esac
 			for j in $(cat "$QD/i.$i" 2>/dev/null || echo "$i"); do
-				alt_delete "$j" || { rm -rf "$QD"; echo "could not delete $i"; return 1; }
+				alt_delete "$j" || { rm -rf "$QD" "$CACHE"; echo "could not delete $i"; return 1; }
 			done
 		done
-		rm -rf "$QD"
+		rm -rf "$QD" "$CACHE"
 		echo ok
 		return 0
 	fi
@@ -370,6 +438,7 @@ cmd_watch() {
 	local first=1 i k tmp
 
 	touch "$SEEN"
+	MAXAGE=5
 	while :; do
 		tmp=$(mktemp)
 		for i in $(sms_indexes); do
